@@ -50,14 +50,14 @@ def calculate_tokenomics(target_mcap: float, sol_price: float) -> dict:
     Returns:
         Dict with supply, price_per_token, liquidity_sol, liquidity_usd, etc.
     """
-    # Large supply looks more attractive (psychological effect)
+    # Max supply is 1 billion
     supply = random.choice([
         1_000_000_000,       # 1B
-        10_000_000_000,      # 10B
-        100_000_000_000,     # 100B
-        420_690_000_000,     # 420.69B (meme number)
-        690_000_000_000,     # 690B
-        1_000_000_000_000,   # 1T
+        690_000_000,         # 690M (meme number)
+        420_690_000,         # 420.69M
+        999_999_999,         # just under 1B
+        777_000_000,         # 777M (lucky number)
+        500_000_000,         # 500M
     ])
 
     # Price per token at target mcap
