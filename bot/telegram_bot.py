@@ -1,9 +1,12 @@
 """
-Telegram bot for creating Solana memecoins.
-Full button-driven UI with rich HTML messages.
+Solana Copy Trading Bot — Telegram UI.
+
+Button-driven interface for discovering top traders, tracking wallets,
+copying trades, and monitoring portfolio.
 """
 
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -13,58 +16,88 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from bot.config import TELEGRAM_BOT_TOKEN, SOLANA_RPC_URL
-from bot.trending import get_trending_topics, pick_trending_name
-from bot.description_generator import generate_full_profile
-from bot.solana_memecoin import create_memecoin, preview_memecoin
+from bot.config import TELEGRAM_BOT_TOKEN, MAX_BUY_SOL, AUTO_COPY
+from bot.top_traders import discover_top_traders, get_trader_stats, TraderStats
+from bot.wallet_tracker import (
+    add_tracked_wallet, remove_tracked_wallet, get_tracked_wallets,
+    on_swap, SwapEvent, restart_tracker,
+)
+from bot.trade_copier import copy_trade, manual_buy, manual_sell
+from bot.portfolio import get_portfolio, record_trade
 
 logger = logging.getLogger(__name__)
+
+# Store bot app reference for sending notifications
+_app = None
 
 
 # ─── Message Builders ────────────────────────────────────────────────
 
-def build_welcome_msg() -> tuple[str, InlineKeyboardMarkup]:
+def build_home_msg() -> tuple[str, InlineKeyboardMarkup]:
+    tracked = get_tracked_wallets()
     text = (
-        "🚀 <b>SOLANA MEMECOIN LAUNCHER</b>\n"
+        "🤖 <b>SOLANA COPY TRADE BOT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Create memecoins from trending memes,\n"
-        "deploy on Solana, all in one tap.\n\n"
-        "📊 Coins launch at <b>$10-20K</b> market cap\n"
-        "⚡ Launched on <b>pump.fun</b>\n"
-        "🎯 Calculated tokenomics\n\n"
-        "👇 <b>Choose an action below</b>"
+        "Copy the best Solana traders automatically.\n"
+        "Find top wallets, track them, and mirror\n"
+        "their trades in real-time.\n\n"
+        f"📡 Tracking: <b>{len(tracked)}</b> wallets\n"
+        f"💰 Max buy: <b>{MAX_BUY_SOL} SOL</b>\n"
+        f"🔄 Auto-copy: <b>{'ON' if AUTO_COPY else 'OFF'}</b>\n\n"
+        "👇 <b>Choose an action</b>"
     )
     keyboard = [
         [
-            InlineKeyboardButton("🔥 Trending", callback_data="trending"),
-            InlineKeyboardButton("👀 Preview", callback_data="preview_random"),
+            InlineKeyboardButton("🏆 Top Traders", callback_data="top_traders"),
+            InlineKeyboardButton("📡 Tracked", callback_data="tracked_wallets"),
         ],
         [
-            InlineKeyboardButton("🚀 Launch Coin", callback_data="launch_random"),
+            InlineKeyboardButton("💼 Portfolio", callback_data="portfolio"),
         ],
         [
+            InlineKeyboardButton("💰 Buy Token", callback_data="buy_prompt"),
+            InlineKeyboardButton("💸 Sell Token", callback_data="sell_prompt"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
             InlineKeyboardButton("❓ Help", callback_data="help"),
         ],
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
 
-def build_trending_msg(trends: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
-    lines = ["🔥 <b>TRENDING NOW</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
-    for i, t in enumerate(trends[:10], 1):
-        source = t.get("source", t.get("category", ""))
-        desc = t.get("description", "")[:50]
-        lines.append(f"<b>{i}.</b> <code>{t['name']}</code> — {desc} <i>[{source}]</i>")
+def build_top_traders_msg(traders: list[TraderStats]) -> tuple[str, InlineKeyboardMarkup]:
+    if not traders:
+        text = (
+            "🏆 <b>TOP TRADERS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "❌ No traders found.\n\n"
+            "Set your <code>BIRDEYE_API_KEY</code> in .env\n"
+            "to discover top wallets automatically."
+        )
+        keyboard = [[InlineKeyboardButton("🏠 Home", callback_data="home")]]
+        return text, InlineKeyboardMarkup(keyboard)
 
-    lines.append("\n👇 <b>Tap a coin to preview or launch it</b>")
+    lines = ["🏆 <b>TOP TRADERS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    for i, t in enumerate(traders[:10], 1):
+        label = t.label or f"{t.address[:6]}...{t.address[-4:]}"
+        pnl_icon = "🟢" if t.total_pnl_usd >= 0 else "🔴"
+        lines.append(
+            f"<b>{i}.</b> {label}\n"
+            f"   {pnl_icon} PnL: <b>${t.total_pnl_usd:,.0f}</b>  •  "
+            f"WR: <b>{t.winrate}%</b>  •  "
+            f"Trades: {t.total_trades}"
+        )
+
+    lines.append("\n👇 <b>Tap to track a wallet</b>")
     text = "\n".join(lines)
 
-    # Build buttons: 2 per row, each trend gets a preview button
     keyboard = []
     row = []
-    for i, t in enumerate(trends[:10]):
+    for i, t in enumerate(traders[:10]):
+        short = t.label or f"{t.address[:6]}"
         row.append(InlineKeyboardButton(
-            f"👀 {t['name']}", callback_data=f"preview_{t['name']}_{t.get('category', 'meme')}"
+            f"📡 {short}", callback_data=f"track_{t.address}"
         ))
         if len(row) == 2:
             keyboard.append(row)
@@ -73,119 +106,177 @@ def build_trending_msg(trends: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
         keyboard.append(row)
 
     keyboard.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data="trending"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="top_traders"),
         InlineKeyboardButton("🏠 Home", callback_data="home"),
     ])
-
     return text, InlineKeyboardMarkup(keyboard)
 
 
-def build_preview_msg(coin: dict, profile: dict) -> tuple[str, InlineKeyboardMarkup]:
-    t = coin["tokenomics"]
-    name = coin["name"]
-    ticker = coin["ticker"]
-    category = coin.get("category", "meme")
+def build_tracked_msg() -> tuple[str, InlineKeyboardMarkup]:
+    wallets = get_tracked_wallets()
+    if not wallets:
+        text = (
+            "📡 <b>TRACKED WALLETS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "No wallets being tracked.\n\n"
+            "Use 🏆 <b>Top Traders</b> to find wallets,\n"
+            "or use /track &lt;address&gt; to add one."
+        )
+        keyboard = [
+            [InlineKeyboardButton("🏆 Find Traders", callback_data="top_traders")],
+            [InlineKeyboardButton("🏠 Home", callback_data="home")],
+        ]
+        return text, InlineKeyboardMarkup(keyboard)
 
-    roadmap_text = "\n".join(f"   ├ {r}" for r in profile["roadmap"][:-1])
-    roadmap_text += f"\n   └ {profile['roadmap'][-1]}"
+    lines = ["📡 <b>TRACKED WALLETS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    for addr, label in wallets.items():
+        short_addr = f"{addr[:6]}...{addr[-4:]}"
+        lines.append(f"🟢 <b>{label}</b>\n   <code>{short_addr}</code>")
 
+    text = "\n".join(lines)
+
+    keyboard = []
+    for addr, label in wallets.items():
+        keyboard.append([
+            InlineKeyboardButton(f"👤 {label}", callback_data=f"stats_{addr}"),
+            InlineKeyboardButton("❌ Remove", callback_data=f"untrack_{addr}"),
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("🏆 Add More", callback_data="top_traders"),
+        InlineKeyboardButton("🏠 Home", callback_data="home"),
+    ])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def build_portfolio_msg(portfolio) -> tuple[str, InlineKeyboardMarkup]:
+    pnl_icon = "🟢" if portfolio.total_pnl_usd >= 0 else "🔴"
+
+    lines = [
+        "💼 <b>PORTFOLIO</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"◎ SOL: <b>{portfolio.sol_balance:.4f}</b> (${portfolio.sol_value_usd:,.2f})\n"
+        f"🪙 Tokens: <b>{portfolio.token_count}</b>\n"
+        f"💰 Total Value: <b>${portfolio.total_value_usd:,.2f}</b>\n"
+        f"{pnl_icon} Total PnL: <b>${portfolio.total_pnl_usd:,.2f}</b>\n\n"
+    ]
+
+    if portfolio.holdings:
+        lines.append("<b>HOLDINGS</b>\n")
+        for h in portfolio.holdings[:10]:
+            h_pnl = "🟢" if h.pnl_usd >= 0 else "🔴"
+            pnl_str = f"{h_pnl} ${h.pnl_usd:,.2f} ({h.pnl_pct:+.1f}%)" if h.cost_basis_usd > 0 else "—"
+            lines.append(
+                f"  <b>{h.symbol}</b>  •  {h.balance:,.2f}\n"
+                f"    💲 ${h.value_usd:,.2f}  •  PnL: {pnl_str}"
+            )
+        lines.append("")
+
+    text = "\n".join(lines)
+
+    # Build sell buttons for each holding
+    keyboard = []
+    for h in portfolio.holdings[:8]:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💸 Sell {h.symbol} (25%)", callback_data=f"sell_{h.mint}_25"
+            ),
+            InlineKeyboardButton(
+                f"💸 50%", callback_data=f"sell_{h.mint}_50"
+            ),
+            InlineKeyboardButton(
+                f"💸 100%", callback_data=f"sell_{h.mint}_100"
+            ),
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data="portfolio"),
+        InlineKeyboardButton("🏠 Home", callback_data="home"),
+    ])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def build_swap_notification(swap: SwapEvent, label: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Build a notification message when a tracked wallet swaps."""
+    icon = "🟢 BUY" if swap.action == "BUY" else "🔴 SELL"
     text = (
-        f"👀 <b>COIN PREVIEW</b>\n"
+        f"🔔 <b>SWAP DETECTED</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🪙 <b>{name}</b>  •  <code>{ticker}</code>\n"
-        f"🏷 Category: <i>{category}</i>\n"
-        f"💬 <i>{profile['tagline']}</i>\n\n"
+        f"👤 Trader: <b>{label}</b>\n"
+        f"📋 Action: <b>{icon}</b>\n"
+        f"🪙 Token: <code>{swap.token_mint[:8]}...{swap.token_mint[-4:]}</code>\n"
+        f"💰 Amount: <b>{swap.amount_sol:.4f} SOL</b>\n"
+        f"🏪 DEX: {swap.dex}\n\n"
+        f"👇 <b>Copy this trade?</b>"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"📋 Copy ({min(swap.amount_sol, MAX_BUY_SOL):.2f} SOL)",
+                callback_data=f"copy_{swap.action}_{swap.token_mint}_{swap.amount_sol:.4f}"
+            ),
+        ],
+        [
+            InlineKeyboardButton("💰 Buy 0.1 SOL", callback_data=f"quickbuy_{swap.token_mint}_0.1"),
+            InlineKeyboardButton("💰 Buy 0.5 SOL", callback_data=f"quickbuy_{swap.token_mint}_0.5"),
+            InlineKeyboardButton("💰 Buy 1 SOL", callback_data=f"quickbuy_{swap.token_mint}_1"),
+        ],
+        [
+            InlineKeyboardButton("📊 Chart", url=f"https://birdeye.so/token/{swap.token_mint}?chain=solana"),
+            InlineKeyboardButton("🔍 TX", url=f"https://solscan.io/tx/{swap.signature}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Skip", callback_data="dismiss"),
+        ],
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
 
-        f"📊 <b>TOKENOMICS</b>\n"
-        f"   ├ Supply: <b>{t['total_supply']:,}</b>\n"
-        f"   ├ MCap: <b>${t['target_mcap']:,.0f}</b>\n"
-        f"   ├ Price: <code>${t['price_per_token_usd']:.10f}</code>\n"
-        f"   └ Dev Buy: <b>{t['initial_buy_sol']} SOL</b> (${t['initial_buy_usd']:,.2f})\n\n"
 
-        f"🎰 <b>PLATFORM</b>\n"
-        f"   └ pump.fun (bonding curve)\n\n"
+def build_trade_result_msg(result: dict, action: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Build a trade execution result message."""
+    icon = "🟢" if action == "BUY" else "🔴"
+    text = (
+        f"{icon} <b>TRADE EXECUTED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Action: <b>{action}</b>\n"
+        f"Token: <code>{result.get('output_mint', result.get('input_mint', ''))[:8]}...</code>\n"
+    )
+    if action == "BUY":
+        text += f"Spent: <b>{result.get('sol_spent', 0):.4f} SOL</b>\n"
+    else:
+        text += f"Received: check explorer\n"
 
-        f"📝 <b>ABOUT</b>\n"
-        f"<i>{profile['description']}</i>\n\n"
-
-        f"🗺 <b>ROADMAP</b>\n"
-        f"{roadmap_text}\n\n"
-
-        f"⚠️ <i>Preview only — not deployed yet</i>"
+    text += (
+        f"Impact: {result.get('price_impact_pct', 0):.2f}%\n\n"
+        f"🔗 <a href=\"{result['tx_url']}\">View Transaction</a>"
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("🚀 Launch This Coin", callback_data=f"launch_{name}_{category}"),
-        ],
-        [
-            InlineKeyboardButton("🔄 New Preview", callback_data="preview_random"),
-            InlineKeyboardButton("🔥 Trending", callback_data="trending"),
-        ],
-        [
+            InlineKeyboardButton("💼 Portfolio", callback_data="portfolio"),
             InlineKeyboardButton("🏠 Home", callback_data="home"),
         ],
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
 
-def build_launch_msg(coin: dict, profile: dict) -> tuple[str, InlineKeyboardMarkup]:
-    t = coin["tokenomics"]
-    name = coin["name"]
-    ticker = coin["ticker"]
-    mint = coin["mint_address"]
-
-    roadmap_text = "\n".join(f"   ├ {r}" for r in profile["roadmap"][:-1])
-    roadmap_text += f"\n   └ {profile['roadmap'][-1]}"
-
+def build_settings_msg() -> tuple[str, InlineKeyboardMarkup]:
+    wallets = get_tracked_wallets()
     text = (
-        f"✅ <b>LAUNCH SUCCESSFUL</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"🪙 <b>{name}</b>  •  <code>{ticker}</code>\n"
-        f"💬 <i>{profile['tagline']}</i>\n\n"
-
-        f"📊 <b>TOKENOMICS</b>\n"
-        f"   ├ Supply: <b>{t['total_supply']:,}</b>\n"
-        f"   ├ MCap: <b>${t['target_mcap']:,.0f}</b>\n"
-        f"   ├ Price: <code>${t['price_per_token_usd']:.10f}</code>\n"
-        f"   └ Dev Buy: <b>{t['initial_buy_sol']} SOL</b> (${t['initial_buy_usd']:,.2f})\n\n"
-
-        f"📋 <b>CONTRACT</b>\n"
-        f"   <code>{mint}</code>\n"
-        f"   Platform: <b>pump.fun</b>\n\n"
-
-        f"📝 <b>ABOUT</b>\n"
-        f"<i>{profile['description']}</i>\n\n"
-
-        f"🗺 <b>ROADMAP</b>\n"
-        f"{roadmap_text}\n\n"
-
-        f"💡 <b>Next:</b> Share the pump.fun link!"
+        "⚙️ <b>SETTINGS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Max buy per trade: <b>{MAX_BUY_SOL} SOL</b>\n"
+        f"📡 Tracked wallets: <b>{len(wallets)}</b>\n"
+        f"🔄 Auto-copy: <b>{'ON' if AUTO_COPY else 'OFF'}</b>\n\n"
+        "⚠️ Edit <code>.env</code> to change:\n"
+        "   • <code>MAX_BUY_SOL</code> — max SOL per trade\n"
+        "   • <code>SLIPPAGE_BPS</code> — slippage (300 = 3%)\n"
+        "   • <code>AUTO_COPY</code> — auto-copy trades\n"
+        "   • <code>BIRDEYE_API_KEY</code> — for trader data\n"
+        "   • <code>HELIUS_API_KEY</code> — for faster RPC"
     )
-
-    pumpfun_url = coin["pumpfun_url"]
-    phantom_url = coin["phantom_url"]
-    explorer_url = coin["explorer_url"]
-
     keyboard = [
-        [
-            InlineKeyboardButton("💰 Buy on Pump.fun", url=pumpfun_url),
-        ],
-        [
-            InlineKeyboardButton("👻 Open in Phantom", url=phantom_url),
-        ],
-        [
-            InlineKeyboardButton("📊 Chart", url=pumpfun_url),
-            InlineKeyboardButton("🔍 Explorer", url=explorer_url),
-        ],
-        [
-            InlineKeyboardButton("📋 Copy CA", callback_data=f"copy_{mint}"),
-        ],
-        [
-            InlineKeyboardButton("🚀 Launch Another", callback_data="launch_random"),
-            InlineKeyboardButton("🏠 Home", callback_data="home"),
-        ],
+        [InlineKeyboardButton("🏠 Home", callback_data="home")],
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -195,63 +286,65 @@ def build_help_msg() -> tuple[str, InlineKeyboardMarkup]:
         "❓ <b>HOW IT WORKS</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "1️⃣ <b>Trending</b> — Scans Reddit & CoinGecko\n"
-        "   for hot memes to turn into coins\n\n"
+        "1️⃣ <b>Discover</b> — Find top traders by\n"
+        "   winrate and PnL from Birdeye data\n\n"
 
-        "2️⃣ <b>Preview</b> — See tokenomics, description\n"
-        "   & roadmap before spending any SOL\n\n"
+        "2️⃣ <b>Track</b> — Monitor their wallets for\n"
+        "   new buys and sells in real-time\n\n"
 
-        "3️⃣ <b>Launch</b> — Deploys on pump.fun\n"
-        "   at $10-20K target market cap\n\n"
+        "3️⃣ <b>Copy</b> — Replicate their trades\n"
+        "   via Jupiter with one tap\n\n"
 
-        "4️⃣ <b>Buy/Sell</b> — Direct links to pump.fun\n"
-        "   & Phantom wallet for trading\n\n"
+        "4️⃣ <b>Portfolio</b> — Track your holdings,\n"
+        "   PnL, and sell with quick buttons\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📌 <b>Commands</b>\n"
         "   /start — Main menu\n"
-        "   /trending — See trends\n"
-        "   /preview — Preview a coin\n"
-        "   /launch — Deploy a coin\n"
-        "   /launch NAME — Deploy custom coin\n"
+        "   /top — Top traders leaderboard\n"
+        "   /track &lt;address&gt; — Track a wallet\n"
+        "   /untrack &lt;address&gt; — Untrack wallet\n"
+        "   /portfolio — View portfolio\n"
+        "   /buy &lt;mint&gt; &lt;sol&gt; — Buy token\n"
+        "   /sell &lt;mint&gt; &lt;pct&gt; — Sell token\n"
     )
     keyboard = [
         [
-            InlineKeyboardButton("🔥 Trending", callback_data="trending"),
-            InlineKeyboardButton("🚀 Launch", callback_data="launch_random"),
-        ],
-        [
+            InlineKeyboardButton("🏆 Top Traders", callback_data="top_traders"),
             InlineKeyboardButton("🏠 Home", callback_data="home"),
         ],
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
 
-def build_deploying_msg(name: str, ticker: str, step: int) -> str:
-    steps = [
-        ("🔍", "Finding trending meme...", "⏳"),
-        ("📡", "Deploying on pump.fun...", "⏳"),
-        ("📝", "Generating profile...", "⏳"),
-    ]
-    lines = [
-        f"🚀 <b>LAUNCHING {name}</b>  •  <code>{ticker}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    ]
-    for i, (icon, desc, pending) in enumerate(steps):
-        if i < step:
-            lines.append(f"   ✅ {desc}")
-        elif i == step:
-            lines.append(f"   ⏳ {desc}")
-        else:
-            lines.append(f"   ⬜ {desc}")
+# ─── Swap Notification Handler ────────────────────────────────────────
 
-    return "\n".join(lines)
+async def handle_swap_event(swap: SwapEvent):
+    """Called by wallet tracker when a swap is detected."""
+    if _app is None:
+        return
+
+    wallets = get_tracked_wallets()
+    label = wallets.get(swap.wallet, swap.wallet[:8])
+    text, keyboard = build_swap_notification(swap, label)
+
+    # Send to all users who started the bot (simplified: broadcast)
+    # In production, you'd store chat IDs. For now, we use context.
+    # This will be sent via the job queue if auto-copy is on.
+    if AUTO_COPY:
+        try:
+            result = await copy_trade(swap)
+            logger.info(f"Auto-copied {swap.action}: {result['tx_url']}")
+        except Exception as e:
+            logger.error(f"Auto-copy failed: {e}")
 
 
-# ─── Handlers ────────────────────────────────────────────────────────
+# ─── Command Handlers ────────────────────────────────────────────────
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text, keyboard = build_welcome_msg()
+    # Store chat_id for notifications
+    context.bot_data.setdefault("chat_ids", set()).add(update.effective_chat.id)
+    text, keyboard = build_home_msg()
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
@@ -260,196 +353,304 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
-async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    loading = await update.message.reply_text("🔍 <b>Scanning trends...</b>", parse_mode=ParseMode.HTML)
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    loading = await update.message.reply_text("🏆 <b>Loading top traders...</b>", parse_mode=ParseMode.HTML)
     try:
-        trends = await get_trending_topics()
-        context.user_data["trends"] = trends
-        text, keyboard = build_trending_msg(trends)
+        traders = await discover_top_traders()
+        context.bot_data["traders"] = traders
+        text, keyboard = build_top_traders_msg(traders)
         await loading.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     except Exception as e:
-        logger.error(f"Trending failed: {e}")
-        await loading.edit_text(f"❌ Failed to fetch trends: {e}")
+        await loading.edit_text(f"❌ Failed: {e}")
 
 
-async def preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    custom_name = " ".join(context.args).strip() if context.args else None
-    await _do_preview(update.message, context, custom_name=custom_name)
+async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /track <wallet_address> [label]")
+        return
+
+    address = context.args[0]
+    label = " ".join(context.args[1:]) if len(context.args) > 1 else f"{address[:6]}...{address[-4:]}"
+
+    add_tracked_wallet(address, label)
+    restart_tracker()
+
+    await update.message.reply_text(
+        f"📡 Now tracking: <b>{label}</b>\n<code>{address}</code>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
-async def launch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    custom_name = " ".join(context.args).strip() if context.args else None
-    await _do_launch(update.message, context, custom_name=custom_name)
+async def untrack_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /untrack <wallet_address>")
+        return
 
+    address = context.args[0]
+    remove_tracked_wallet(address)
+    restart_tracker()
+
+    await update.message.reply_text(f"❌ Stopped tracking <code>{address[:8]}...</code>", parse_mode=ParseMode.HTML)
+
+
+async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    loading = await update.message.reply_text("💼 <b>Loading portfolio...</b>", parse_mode=ParseMode.HTML)
+    try:
+        portfolio = await get_portfolio()
+        text, keyboard = build_portfolio_msg(portfolio)
+        await loading.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except Exception as e:
+        await loading.edit_text(f"❌ Failed: {e}")
+
+
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /buy <token_mint> <sol_amount>")
+        return
+
+    mint = context.args[0]
+    try:
+        sol_amount = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid SOL amount")
+        return
+
+    loading = await update.message.reply_text(
+        f"💰 <b>Buying with {sol_amount} SOL...</b>", parse_mode=ParseMode.HTML
+    )
+    try:
+        result = await manual_buy(mint, sol_amount)
+        text, keyboard = build_trade_result_msg(result, "BUY")
+        await loading.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                disable_web_page_preview=True)
+    except Exception as e:
+        await loading.edit_text(f"❌ Buy failed: {e}")
+
+
+async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /sell <token_mint> [percentage]")
+        return
+
+    mint = context.args[0]
+    pct = float(context.args[1]) if len(context.args) > 1 else 100.0
+
+    loading = await update.message.reply_text(
+        f"💸 <b>Selling {pct}%...</b>", parse_mode=ParseMode.HTML
+    )
+    try:
+        result = await manual_sell(mint, pct)
+        text, keyboard = build_trade_result_msg(result, "SELL")
+        await loading.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                disable_web_page_preview=True)
+    except Exception as e:
+        await loading.edit_text(f"❌ Sell failed: {e}")
+
+
+# ─── Button Handler ──────────────────────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle all inline button presses."""
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data == "home":
-        text, keyboard = build_welcome_msg()
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-    elif data == "help":
-        text, keyboard = build_help_msg()
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-    elif data == "trending":
-        await query.edit_message_text("🔍 <b>Scanning trends...</b>", parse_mode=ParseMode.HTML)
-        try:
-            trends = await get_trending_topics()
-            context.user_data["trends"] = trends
-            text, keyboard = build_trending_msg(trends)
+    try:
+        if data == "home":
+            text, keyboard = build_home_msg()
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        except Exception as e:
-            await query.edit_message_text(f"❌ Failed: {e}")
 
-    elif data == "preview_random":
-        await _do_preview(query.message, context, edit=True)
+        elif data == "help":
+            text, keyboard = build_help_msg()
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    elif data.startswith("preview_"):
-        parts = data.split("_", 2)
-        if len(parts) >= 3:
-            name = parts[1]
-            category = parts[2]
-        else:
-            name = parts[1]
-            category = "meme"
-        await _do_preview(query.message, context, custom_name=name, category=category, edit=True)
+        elif data == "settings":
+            text, keyboard = build_settings_msg()
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    elif data == "launch_random":
-        await _do_launch(query.message, context, edit=True)
+        elif data == "top_traders":
+            await query.edit_message_text("🏆 <b>Loading top traders...</b>", parse_mode=ParseMode.HTML)
+            traders = await discover_top_traders()
+            context.bot_data["traders"] = traders
+            text, keyboard = build_top_traders_msg(traders)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    elif data.startswith("launch_"):
-        parts = data.split("_", 2)
-        if len(parts) >= 3:
-            name = parts[1]
-            category = parts[2]
-        else:
-            name = parts[1]
-            category = "meme"
-        await _do_launch(query.message, context, custom_name=name, category=category, edit=True)
+        elif data == "tracked_wallets":
+            text, keyboard = build_tracked_msg()
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    elif data.startswith("copy_"):
-        mint = data[5:]
-        await query.answer(text=f"📋 CA: {mint}", show_alert=True)
+        elif data.startswith("track_"):
+            address = data[6:]
+            label = f"{address[:6]}...{address[-4:]}"
+            # Check if we have trader stats with a label
+            traders = context.bot_data.get("traders", [])
+            for t in traders:
+                if t.address == address and t.label:
+                    label = t.label
+                    break
 
+            add_tracked_wallet(address, label)
+            restart_tracker()
 
-# ─── Core Logic ──────────────────────────────────────────────────────
+            await query.answer(f"📡 Now tracking {label}", show_alert=True)
+            text, keyboard = build_tracked_msg()
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-async def _do_preview(message, context, custom_name=None, category=None, edit=False):
-    """Preview a coin. Works for both commands and button callbacks."""
-    try:
-        if custom_name:
-            name = custom_name.upper().replace(" ", "")
-            ticker = f"${name[:6]}"
-            cat = category or "meme"
-        else:
-            trends = context.user_data.get("trends") or await get_trending_topics()
-            context.user_data["trends"] = trends
-            trend = pick_trending_name(trends)
-            name = trend["name"]
-            ticker = f"${name[:6]}"
-            cat = trend.get("category", "meme")
+        elif data.startswith("untrack_"):
+            address = data[8:]
+            remove_tracked_wallet(address)
+            restart_tracker()
+            text, keyboard = build_tracked_msg()
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-        coin = preview_memecoin(name, ticker, cat)
-        profile = generate_full_profile(name, ticker, cat, mint_address="TBD")
-        text, keyboard = build_preview_msg(coin, profile)
+        elif data.startswith("stats_"):
+            address = data[6:]
+            await query.edit_message_text("📊 <b>Loading stats...</b>", parse_mode=ParseMode.HTML)
+            stats = await get_trader_stats(address)
+            pnl_icon = "🟢" if stats.total_pnl_usd >= 0 else "🔴"
+            label = stats.label or f"{address[:6]}...{address[-4:]}"
+            text = (
+                f"👤 <b>{label}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📋 Address: <code>{address}</code>\n\n"
+                f"📊 Trades: <b>{stats.total_trades}</b>\n"
+                f"✅ Wins: <b>{stats.winning_trades}</b>\n"
+                f"🎯 Winrate: <b>{stats.winrate}%</b>\n"
+                f"{pnl_icon} PnL: <b>${stats.total_pnl_usd:,.2f}</b>\n"
+                f"💰 Avg Size: <b>${stats.avg_trade_size_usd:,.2f}</b>\n"
+            )
+            if stats.tokens_traded:
+                text += f"\n🪙 Recent: {', '.join(stats.tokens_traded[:5])}"
 
-        if edit:
-            await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        else:
-            await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            keyboard = [
+                [
+                    InlineKeyboardButton("📡 Track", callback_data=f"track_{address}"),
+                    InlineKeyboardButton("🔍 Solscan", url=f"https://solscan.io/account/{address}"),
+                ],
+                [
+                    InlineKeyboardButton("🏆 Top Traders", callback_data="top_traders"),
+                    InlineKeyboardButton("🏠 Home", callback_data="home"),
+                ],
+            ]
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                          reply_markup=InlineKeyboardMarkup(keyboard))
+
+        elif data == "portfolio":
+            await query.edit_message_text("💼 <b>Loading portfolio...</b>", parse_mode=ParseMode.HTML)
+            portfolio = await get_portfolio()
+            text, keyboard = build_portfolio_msg(portfolio)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+        elif data.startswith("sell_"):
+            parts = data.split("_")
+            # sell_<mint>_<pct>
+            mint = parts[1]
+            pct = float(parts[2])
+            await query.edit_message_text(f"💸 <b>Selling {pct}%...</b>", parse_mode=ParseMode.HTML)
+            result = await manual_sell(mint, pct)
+            text, keyboard = build_trade_result_msg(result, "SELL")
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                          disable_web_page_preview=True)
+
+        elif data.startswith("quickbuy_"):
+            parts = data.split("_")
+            # quickbuy_<mint>_<sol>
+            mint = parts[1]
+            sol = float(parts[2])
+            await query.edit_message_text(f"💰 <b>Buying with {sol} SOL...</b>", parse_mode=ParseMode.HTML)
+            result = await manual_buy(mint, sol)
+            text, keyboard = build_trade_result_msg(result, "BUY")
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                          disable_web_page_preview=True)
+
+        elif data.startswith("copy_"):
+            parts = data.split("_")
+            # copy_<action>_<mint>_<sol>
+            action = parts[1]
+            mint = parts[2]
+            sol = float(parts[3])
+            capped_sol = min(sol, MAX_BUY_SOL)
+
+            await query.edit_message_text(
+                f"📋 <b>Copying {action}...</b>", parse_mode=ParseMode.HTML
+            )
+
+            if action == "BUY":
+                result = await manual_buy(mint, capped_sol)
+            else:
+                result = await manual_sell(mint)
+
+            text, keyboard = build_trade_result_msg(result, action)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                          disable_web_page_preview=True)
+
+        elif data == "buy_prompt":
+            text = (
+                "💰 <b>BUY TOKEN</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Send a command:\n"
+                "<code>/buy &lt;token_mint&gt; &lt;sol_amount&gt;</code>\n\n"
+                "Example:\n"
+                "<code>/buy EPjFWdd5AufqSSqeM2q... 0.5</code>"
+            )
+            keyboard = [[InlineKeyboardButton("🏠 Home", callback_data="home")]]
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                          reply_markup=InlineKeyboardMarkup(keyboard))
+
+        elif data == "sell_prompt":
+            text = (
+                "💸 <b>SELL TOKEN</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Send a command:\n"
+                "<code>/sell &lt;token_mint&gt; [percentage]</code>\n\n"
+                "Example:\n"
+                "<code>/sell EPjFWdd5AufqSSqeM2q... 50</code>\n\n"
+                "Or use the 💼 Portfolio to sell with buttons."
+            )
+            keyboard = [
+                [InlineKeyboardButton("💼 Portfolio", callback_data="portfolio")],
+                [InlineKeyboardButton("🏠 Home", callback_data="home")],
+            ]
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                          reply_markup=InlineKeyboardMarkup(keyboard))
+
+        elif data == "dismiss":
+            await query.delete_message()
 
     except Exception as e:
-        logger.error(f"Preview failed: {e}")
-        err = f"❌ Preview failed: {e}"
-        if edit:
-            await message.edit_text(err)
-        else:
-            await message.reply_text(err)
-
-
-async def _do_launch(message, context, custom_name=None, category=None, edit=False):
-    """Full launch: deploy token on Solana. Works for both commands and buttons."""
-    try:
-        # Resolve name
-        if custom_name:
-            name = custom_name.upper().replace(" ", "")
-            ticker = f"${name[:6]}"
-            cat = category or "meme"
-        else:
-            trends = context.user_data.get("trends") or await get_trending_topics()
-            context.user_data["trends"] = trends
-            trend = pick_trending_name(trends)
-            name = trend["name"]
-            ticker = f"${name[:6]}"
-            cat = trend.get("category", "meme")
-
-        # Step 1: Show deploying status
-        deploying_text = build_deploying_msg(name, ticker, 1)
-        if edit:
-            await message.edit_text(deploying_text, parse_mode=ParseMode.HTML)
-        else:
-            message = await message.reply_text(deploying_text, parse_mode=ParseMode.HTML)
-
-        # Step 2: Generate profile first (need description for pump.fun)
-        profile = generate_full_profile(name, ticker, cat, mint_address="TBD")
-
-        # Step 3: Deploy on pump.fun
-        coin = await create_memecoin(name, ticker, profile["description"], cat)
-
-        await message.edit_text(build_deploying_msg(name, ticker, 2), parse_mode=ParseMode.HTML)
-        # Update profile with actual mint address
-        profile = generate_full_profile(name, ticker, cat, coin["mint_address"])
-
-        # Done — show full launch card with buttons
-        text, keyboard = build_launch_msg(coin, profile)
-        await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-    except ValueError as e:
-        err = f"⚠️ <b>Config error:</b> {e}\n\nCheck your <code>.env</code> file."
+        logger.error(f"Button handler error: {e}", exc_info=True)
+        keyboard = [[InlineKeyboardButton("🏠 Home", callback_data="home")]]
         try:
-            await message.edit_text(err, parse_mode=ParseMode.HTML)
+            await query.edit_message_text(
+                f"❌ Error: {e}", reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         except Exception:
-            await message.reply_text(err, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Launch failed: {e}", exc_info=True)
-        err = (
-            f"❌ <b>Launch failed:</b> {e}\n\n"
-            "Make sure you have:\n"
-            "  • SOL in your wallet (for pump.fun fees)\n"
-            "  • Valid private key in .env"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Try Again", callback_data="launch_random")],
-            [InlineKeyboardButton("🏠 Home", callback_data="home")],
-        ])
-        try:
-            await message.edit_text(err, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        except Exception:
-            await message.reply_text(err, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            pass
 
 
 # ─── Bot Runner ──────────────────────────────────────────────────────
 
 def run_bot() -> None:
+    global _app
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN not set! Get one from @BotFather.")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    _app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Register swap event handler
+    on_swap(handle_swap_event)
 
     # Commands
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("trending", trending_command))
-    app.add_handler(CommandHandler("preview", preview_command))
-    app.add_handler(CommandHandler("launch", launch_command))
+    _app.add_handler(CommandHandler("start", start_command))
+    _app.add_handler(CommandHandler("help", help_command))
+    _app.add_handler(CommandHandler("top", top_command))
+    _app.add_handler(CommandHandler("track", track_command))
+    _app.add_handler(CommandHandler("untrack", untrack_command))
+    _app.add_handler(CommandHandler("portfolio", portfolio_command))
+    _app.add_handler(CommandHandler("buy", buy_command))
+    _app.add_handler(CommandHandler("sell", sell_command))
 
     # Button callbacks
-    app.add_handler(CallbackQueryHandler(button_handler))
+    _app.add_handler(CallbackQueryHandler(button_handler))
 
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Copy Trade Bot is running. Press Ctrl+C to stop.")
+    _app.run_polling(allowed_updates=Update.ALL_TYPES)
