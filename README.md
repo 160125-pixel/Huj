@@ -1,47 +1,80 @@
-# Solana Memecoin Telegram Bot
+# Solana Memecoin Launcher Bot
 
-A Telegram bot that creates Solana memecoins with dumb randomly-generated names, absurd supplies, and hilarious descriptions.
+A Telegram bot that finds trending memes, creates Solana memecoins with realistic profiles, auto-creates Telegram channels, and targets 10-20K market cap at launch.
+
+## What It Does
+
+1. **Scans trends** — Pulls trending topics from Reddit, CoinGecko, and curated meme lists
+2. **Creates tokens** — Deploys SPL tokens on Solana with calculated tokenomics
+3. **Generates profiles** — Realistic descriptions, taglines, roadmaps, and channel bios
+4. **Creates channels** — Auto-creates a Telegram group for each coin with pinned info
+5. **Targets market cap** — Calculates supply, price, and liquidity for $10-20K launch
 
 ## Setup
 
-1. **Clone and install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 1. Install dependencies
+```bash
+pip install -r requirements.txt
+```
 
-2. **Configure environment:**
-   ```bash
-   cp .env.example .env
-   ```
-   Fill in your `.env`:
-   - `TELEGRAM_BOT_TOKEN` — Get from [@BotFather](https://t.me/BotFather)
-   - `SOLANA_RPC_URL` — Defaults to devnet
-   - `SOLANA_PRIVATE_KEY` — Base58 encoded private key of the wallet that pays for token creation
+### 2. Configure environment
+```bash
+cp .env.example .env
+```
 
-3. **Run the bot:**
-   ```bash
-   python main.py
-   ```
+Fill in `.env`:
+
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | From [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_API_ID` | From [my.telegram.org/apps](https://my.telegram.org/apps) |
+| `TELEGRAM_API_HASH` | From [my.telegram.org/apps](https://my.telegram.org/apps) |
+| `TELEGRAM_PHONE` | Phone number linked to Telegram account |
+| `SOLANA_RPC_URL` | Solana RPC (defaults to devnet) |
+| `SOLANA_PRIVATE_KEY` | Base58 wallet private key |
+| `TARGET_MCAP_MIN` | Min target market cap in USD (default: 10000) |
+| `TARGET_MCAP_MAX` | Max target market cap in USD (default: 20000) |
+| `SOL_PRICE_USD` | Current SOL price for LP calculations (default: 150) |
+
+### 3. Authenticate Telethon
+First run will prompt for your Telegram phone code (one-time):
+```bash
+python main.py
+```
 
 ## Bot Commands
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Welcome message |
-| `/preview` | Preview a random memecoin (free) |
+| `/start` | Welcome message and help |
+| `/trending` | Show currently trending memes and topics |
+| `/preview` | Preview a coin from a random trending meme |
 | `/preview <name>` | Preview with a custom name |
-| `/create` | Deploy a random memecoin on Solana (costs SOL) |
-| `/create <name>` | Deploy with a custom name |
+| `/launch` | Full launch: token + channel from trending meme |
+| `/launch <name>` | Full launch with custom name |
 | `/help` | Show help |
 
-## How It Works
+## Architecture
 
-1. Generates a dumb name from random prefix + suffix combos (e.g. `DOGEPUMP`, `PEPELAMBO`, `CHONKWAGMI`)
-2. Picks an absurdly large supply (e.g. 69,420,000,000,000)
-3. Creates an SPL token on Solana
-4. Mints the entire supply to your wallet
-5. You're now a "crypto founder"
+```
+bot/
+  config.py              — Environment config
+  trending.py            — Trending meme scanner (Reddit, CoinGecko)
+  description_generator.py — Realistic description/bio generator
+  solana_memecoin.py     — SPL token creation + tokenomics calculator
+  channel_creator.py     — Telegram channel auto-creator (Telethon)
+  telegram_bot.py        — Main bot commands and launch flow
+main.py                  — Entry point
+```
 
-## Disclaimer
+## Launch Flow
 
-This is for fun / educational purposes. These tokens have zero value. NFA. DYOR.
+```
+/launch → Scan Trends → Pick Meme → Deploy Token → Generate Profile → Create Channel → Done
+```
+
+Each launch outputs:
+- Token contract address + explorer link
+- Tokenomics (supply, price, LP needed)
+- Telegram channel with invite link
+- Pinned message with full project info + roadmap

@@ -1,20 +1,17 @@
 """
-Solana memecoin creator — the dumb way.
+Solana memecoin creator with market cap targeting.
 
-Creates an SPL token on Solana with a ridiculous supply,
-mints it all to the creator's wallet, and calls it a "memecoin".
-That's it. That's the whole thing.
+Creates SPL tokens on Solana, calculates supply and initial liquidity
+to hit a target market cap of 10-20k USD at launch.
 """
 
 import random
 import base58
 from solana.rpc.api import Client
 from solders.keypair import Keypair
-from solders.pubkey import Pubkey
 from solders.system_program import CreateAccountParams, create_account
 from solders.transaction import Transaction
 from solders.message import Message
-from solders.hash import Hash
 from spl.token.instructions import (
     InitializeMintParams,
     MintToParams,
@@ -23,116 +20,103 @@ from spl.token.instructions import (
     get_associated_token_address,
     create_associated_token_account,
 )
-from spl.token.constants import TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+from spl.token.constants import TOKEN_PROGRAM_ID
 
-from bot.config import SOLANA_RPC_URL, SOLANA_PRIVATE_KEY
-
-# Dumb memecoin name generator
-PREFIXES = [
-    "DOGE", "PEPE", "MOON", "ROCKET", "BONK", "WIF", "SHIB",
-    "FROG", "CAT", "CHAD", "GIGA", "TURBO", "MEGA", "BABY",
-    "DARK", "ELON", "TRUMP", "BASED", "DEGEN", "APE", "WOJAK",
-    "SMOL", "THICC", "CHONK", "FLOKI", "SNEK", "MONKE", "HODL",
-]
-
-SUFFIXES = [
-    "INU", "COIN", "TOKEN", "SWAP", "MOON", "ROCKET", "PUMP",
-    "LAMBO", "WAGMI", "NGMI", "GM", "GN", "SER", "FREN",
-    "TENDIES", "STONKS", "YOLO", "COPE", "SEETHE", "MALD",
-    "2.0", "AI", "GPT", "CHAIN", "FI", "DAO", "VERSE",
-]
-
-DUMB_DESCRIPTIONS = [
-    "To the moon! (or to zero, probably zero)",
-    "Not financial advice (it's literally a meme)",
-    "1000x potential* (*potential to lose everything)",
-    "The next big thing in losing money speedrun",
-    "Community driven (by pure degeneracy)",
-    "Backed by nothing, fueled by vibes",
-    "Whitepaper: trust me bro",
-    "Rug pull resistant** (**not actually resistant)",
-    "Making millionaires* (*of the devs only)",
-    "Built different (built worse actually)",
-    "Deflationary* (*your wallet balance deflates)",
-    "Utility: makes you mass text your friends at 3am",
-]
-
-
-def generate_dumb_name() -> tuple[str, str]:
-    """Generate a hilariously dumb memecoin name and ticker."""
-    prefix = random.choice(PREFIXES)
-    suffix = random.choice(SUFFIXES)
-    name = f"{prefix}{suffix}"
-    ticker = f"${name[:6].upper()}"
-    return name, ticker
-
-
-def generate_dumb_supply() -> int:
-    """Generate an absurdly large token supply because why not."""
-    bases = [420, 69, 1337, 80085, 42069, 69420]
-    multipliers = [1_000_000, 1_000_000_000, 1_000_000_000_000]
-    return random.choice(bases) * random.choice(multipliers)
-
-
-def generate_dumb_description() -> str:
-    """Pick a random dumb description."""
-    return random.choice(DUMB_DESCRIPTIONS)
+from bot.config import (
+    SOLANA_RPC_URL, SOLANA_PRIVATE_KEY,
+    TARGET_MCAP_MIN, TARGET_MCAP_MAX, INITIAL_SOL_PRICE_USD,
+)
 
 
 def get_client() -> Client:
-    """Create a Solana RPC client."""
     return Client(SOLANA_RPC_URL)
 
 
 def get_payer_keypair() -> Keypair:
-    """Load the payer keypair from the private key."""
     if not SOLANA_PRIVATE_KEY:
         raise ValueError("SOLANA_PRIVATE_KEY not set in environment")
-    secret_key = base58.b58decode(SOLANA_PRIVATE_KEY)
-    return Keypair.from_bytes(secret_key)
+    return Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
 
 
-def create_memecoin(custom_name: str | None = None) -> dict:
+def calculate_tokenomics(target_mcap: float, sol_price: float) -> dict:
     """
-    Create a memecoin on Solana. The dumb way.
+    Calculate supply, initial price, and liquidity needed for target market cap.
 
-    1. Generate a new mint keypair
-    2. Create the mint account
-    3. Initialize it as an SPL token
-    4. Create an associated token account for the payer
-    5. Mint an absurd amount of tokens
-    6. Return the details
-
-    Args:
-        custom_name: Optional custom name. If None, generates a dumb random one.
+    For a memecoin launching at $10-20k market cap:
+    - Pick a large total supply (looks attractive to buyers)
+    - Set initial token price = target_mcap / supply
+    - Calculate SOL needed for initial liquidity pool
 
     Returns:
-        Dict with token details (name, ticker, supply, mint address, etc.)
+        Dict with supply, price_per_token, liquidity_sol, liquidity_usd, etc.
+    """
+    # Large supply looks more attractive (psychological effect)
+    supply = random.choice([
+        1_000_000_000,       # 1B
+        10_000_000_000,      # 10B
+        100_000_000_000,     # 100B
+        420_690_000_000,     # 420.69B (meme number)
+        690_000_000_000,     # 690B
+        1_000_000_000_000,   # 1T
+    ])
+
+    # Price per token at target mcap
+    price_per_token = target_mcap / supply
+
+    # Initial liquidity: we seed the pool with some tokens + SOL
+    # Typical AMM: liquidity_tokens * liquidity_sol = k (constant product)
+    # We put ~10% of supply into the pool + equivalent SOL value
+    pool_token_pct = 0.10
+    pool_tokens = int(supply * pool_token_pct)
+    pool_value_usd = pool_tokens * price_per_token
+    liquidity_sol = pool_value_usd / sol_price
+
+    return {
+        "total_supply": supply,
+        "decimals": 9,
+        "price_per_token_usd": price_per_token,
+        "pool_token_amount": pool_tokens,
+        "pool_token_pct": pool_token_pct,
+        "liquidity_sol": round(liquidity_sol, 4),
+        "liquidity_usd": round(pool_value_usd, 2),
+        "target_mcap": target_mcap,
+    }
+
+
+def create_memecoin(name: str, ticker: str, category: str = "meme") -> dict:
+    """
+    Create and deploy a memecoin on Solana.
+
+    1. Calculate tokenomics for 10-20k market cap
+    2. Create SPL token mint
+    3. Mint supply to creator wallet
+    4. Return full details including liquidity requirements
+
+    Args:
+        name: Token name
+        ticker: Token ticker symbol
+        category: Trend category for description generation
+
+    Returns:
+        Dict with all token + deployment details
     """
     client = get_client()
     payer = get_payer_keypair()
 
-    # Generate token identity
-    if custom_name:
-        name = custom_name.upper().replace(" ", "")
-        ticker = f"${name[:6]}"
-    else:
-        name, ticker = generate_dumb_name()
+    # Target a random market cap in the 10-20k range
+    target_mcap = random.uniform(TARGET_MCAP_MIN, TARGET_MCAP_MAX)
+    tokenomics = calculate_tokenomics(target_mcap, INITIAL_SOL_PRICE_USD)
 
-    supply = generate_dumb_supply()
-    description = generate_dumb_description()
-    decimals = 9
+    supply = tokenomics["total_supply"]
+    decimals = tokenomics["decimals"]
 
-    # Create new mint keypair
+    # Create new mint
     mint_keypair = Keypair()
     mint_pubkey = mint_keypair.pubkey()
 
-    # Calculate minimum rent exemption for mint account (82 bytes for SPL Token mint)
-    min_balance_resp = client.get_minimum_balance_for_rent_exemption(82)
-    min_balance = min_balance_resp.value
+    min_balance = client.get_minimum_balance_for_rent_exemption(82).value
 
-    # Build transaction
-    # 1. Create account for the mint
+    # Build transaction with all instructions
     create_account_ix = create_account(
         CreateAccountParams(
             from_pubkey=payer.pubkey(),
@@ -143,7 +127,6 @@ def create_memecoin(custom_name: str | None = None) -> dict:
         )
     )
 
-    # 2. Initialize the mint
     init_mint_ix = initialize_mint(
         InitializeMintParams(
             program_id=TOKEN_PROGRAM_ID,
@@ -154,7 +137,6 @@ def create_memecoin(custom_name: str | None = None) -> dict:
         )
     )
 
-    # 3. Create associated token account for payer
     ata = get_associated_token_address(payer.pubkey(), mint_pubkey)
     create_ata_ix = create_associated_token_account(
         payer=payer.pubkey(),
@@ -162,7 +144,6 @@ def create_memecoin(custom_name: str | None = None) -> dict:
         mint=mint_pubkey,
     )
 
-    # 4. Mint tokens to the payer's ATA
     raw_amount = supply * (10 ** decimals)
     mint_to_ix = mint_to(
         MintToParams(
@@ -175,11 +156,8 @@ def create_memecoin(custom_name: str | None = None) -> dict:
         )
     )
 
-    # Get recent blockhash
-    recent_blockhash_resp = client.get_latest_blockhash()
-    recent_blockhash = recent_blockhash_resp.value.blockhash
+    recent_blockhash = client.get_latest_blockhash().value.blockhash
 
-    # Build and sign transaction
     msg = Message.new_with_blockhash(
         [create_account_ix, init_mint_ix, create_ata_ix, mint_to_ix],
         payer.pubkey(),
@@ -188,38 +166,38 @@ def create_memecoin(custom_name: str | None = None) -> dict:
     tx = Transaction.new_unsigned(msg)
     tx.sign([payer, mint_keypair], recent_blockhash)
 
-    # Send transaction
     tx_resp = client.send_transaction(tx)
     tx_signature = str(tx_resp.value)
 
+    # Build explorer URL
+    cluster_param = "?cluster=devnet" if "devnet" in SOLANA_RPC_URL else ""
+    explorer_base = "https://explorer.solana.com"
+
     return {
         "name": name,
         "ticker": ticker,
+        "category": category,
         "supply": supply,
         "decimals": decimals,
-        "description": description,
         "mint_address": str(mint_pubkey),
         "token_account": str(ata),
         "tx_signature": tx_signature,
+        "explorer_url": f"{explorer_base}/address/{str(mint_pubkey)}{cluster_param}",
+        "tx_url": f"{explorer_base}/tx/{tx_signature}{cluster_param}",
         "rpc_url": SOLANA_RPC_URL,
+        "tokenomics": tokenomics,
     }
 
 
-def preview_memecoin(custom_name: str | None = None) -> dict:
-    """
-    Preview a memecoin without actually creating it on-chain.
-    Good for laughs without spending SOL.
-    """
-    if custom_name:
-        name = custom_name.upper().replace(" ", "")
-        ticker = f"${name[:6]}"
-    else:
-        name, ticker = generate_dumb_name()
+def preview_memecoin(name: str, ticker: str, category: str = "meme") -> dict:
+    """Preview tokenomics without deploying on-chain."""
+    target_mcap = random.uniform(TARGET_MCAP_MIN, TARGET_MCAP_MAX)
+    tokenomics = calculate_tokenomics(target_mcap, INITIAL_SOL_PRICE_USD)
 
     return {
         "name": name,
         "ticker": ticker,
-        "supply": generate_dumb_supply(),
-        "description": generate_dumb_description(),
-        "status": "PREVIEW (not deployed yet, relax)",
+        "category": category,
+        "supply": tokenomics["total_supply"],
+        "tokenomics": tokenomics,
     }
