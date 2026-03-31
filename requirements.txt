@@ -1,0 +1,7 @@
+python-telegram-bot==21.6
+solana==0.35.0
+solders==0.21.0
+spl-token==0.1.1
+python-dotenv==1.0.1
+anchorpy==0.20.1
+construct==2.10.70
