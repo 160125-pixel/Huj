@@ -30,7 +30,7 @@ def build_welcome_msg() -> tuple[str, InlineKeyboardMarkup]:
         "Create memecoins from trending memes,\n"
         "deploy on Solana, all in one tap.\n\n"
         "📊 Coins launch at <b>$10-20K</b> market cap\n"
-        "⚡ Powered by Solana\n"
+        "⚡ Launched on <b>pump.fun</b>\n"
         "🎯 Calculated tokenomics\n\n"
         "👇 <b>Choose an action below</b>"
     )
@@ -100,8 +100,10 @@ def build_preview_msg(coin: dict, profile: dict) -> tuple[str, InlineKeyboardMar
         f"   ├ Supply: <b>{t['total_supply']:,}</b>\n"
         f"   ├ MCap: <b>${t['target_mcap']:,.0f}</b>\n"
         f"   ├ Price: <code>${t['price_per_token_usd']:.10f}</code>\n"
-        f"   ├ LP: <b>{t['liquidity_sol']} SOL</b> (${t['liquidity_usd']:,.2f})\n"
-        f"   └ Pool: {t['pool_token_pct']*100:.0f}% of supply\n\n"
+        f"   └ Dev Buy: <b>{t['initial_buy_sol']} SOL</b> (${t['initial_buy_usd']:,.2f})\n\n"
+
+        f"🎰 <b>PLATFORM</b>\n"
+        f"   └ pump.fun (bonding curve)\n\n"
 
         f"📝 <b>ABOUT</b>\n"
         f"<i>{profile['description']}</i>\n\n"
@@ -133,8 +135,6 @@ def build_launch_msg(coin: dict, profile: dict) -> tuple[str, InlineKeyboardMark
     ticker = coin["ticker"]
     mint = coin["mint_address"]
 
-    cluster = "devnet" if "devnet" in coin.get("rpc_url", SOLANA_RPC_URL) else "mainnet"
-
     roadmap_text = "\n".join(f"   ├ {r}" for r in profile["roadmap"][:-1])
     roadmap_text += f"\n   └ {profile['roadmap'][-1]}"
 
@@ -149,12 +149,11 @@ def build_launch_msg(coin: dict, profile: dict) -> tuple[str, InlineKeyboardMark
         f"   ├ Supply: <b>{t['total_supply']:,}</b>\n"
         f"   ├ MCap: <b>${t['target_mcap']:,.0f}</b>\n"
         f"   ├ Price: <code>${t['price_per_token_usd']:.10f}</code>\n"
-        f"   ├ LP: <b>{t['liquidity_sol']} SOL</b> (${t['liquidity_usd']:,.2f})\n"
-        f"   └ Pool: {t['pool_token_pct']*100:.0f}% of supply\n\n"
+        f"   └ Dev Buy: <b>{t['initial_buy_sol']} SOL</b> (${t['initial_buy_usd']:,.2f})\n\n"
 
         f"📋 <b>CONTRACT</b>\n"
         f"   <code>{mint}</code>\n"
-        f"   Network: <b>{cluster}</b>\n\n"
+        f"   Platform: <b>pump.fun</b>\n\n"
 
         f"📝 <b>ABOUT</b>\n"
         f"<i>{profile['description']}</i>\n\n"
@@ -162,27 +161,23 @@ def build_launch_msg(coin: dict, profile: dict) -> tuple[str, InlineKeyboardMark
         f"🗺 <b>ROADMAP</b>\n"
         f"{roadmap_text}\n\n"
 
-        f"💡 <b>Next:</b> Add {t['liquidity_sol']} SOL to LP"
+        f"💡 <b>Next:</b> Share the pump.fun link!"
     )
 
-    # DEX buy/sell links
-    if "devnet" in coin.get("rpc_url", SOLANA_RPC_URL):
-        raydium_url = f"https://raydium.io/swap/?inputMint=sol&outputMint={mint}"
-        jupiter_url = f"https://jup.ag/swap/SOL-{mint}"
-        birdeye_url = f"https://birdeye.so/token/{mint}?chain=solana"
-    else:
-        raydium_url = f"https://raydium.io/swap/?inputMint=sol&outputMint={mint}"
-        jupiter_url = f"https://jup.ag/swap/SOL-{mint}"
-        birdeye_url = f"https://birdeye.so/token/{mint}?chain=solana"
+    pumpfun_url = coin["pumpfun_url"]
+    phantom_url = coin["phantom_url"]
+    explorer_url = coin["explorer_url"]
 
     keyboard = [
         [
-            InlineKeyboardButton("💰 Buy on Raydium", url=raydium_url),
-            InlineKeyboardButton("💰 Buy on Jupiter", url=jupiter_url),
+            InlineKeyboardButton("💰 Buy on Pump.fun", url=pumpfun_url),
         ],
         [
-            InlineKeyboardButton("📊 Chart", url=birdeye_url),
-            InlineKeyboardButton("🔍 Explorer", url=coin["explorer_url"]),
+            InlineKeyboardButton("👻 Open in Phantom", url=phantom_url),
+        ],
+        [
+            InlineKeyboardButton("📊 Chart", url=pumpfun_url),
+            InlineKeyboardButton("🔍 Explorer", url=explorer_url),
         ],
         [
             InlineKeyboardButton("📋 Copy CA", callback_data=f"copy_{mint}"),
@@ -206,11 +201,11 @@ def build_help_msg() -> tuple[str, InlineKeyboardMarkup]:
         "2️⃣ <b>Preview</b> — See tokenomics, description\n"
         "   & roadmap before spending any SOL\n\n"
 
-        "3️⃣ <b>Launch</b> — Deploys an SPL token on\n"
-        "   Solana at $10-20K target market cap\n\n"
+        "3️⃣ <b>Launch</b> — Deploys on pump.fun\n"
+        "   at $10-20K target market cap\n\n"
 
-        "4️⃣ <b>Buy/Sell</b> — Direct links to Raydium\n"
-        "   & Jupiter for trading after launch\n\n"
+        "4️⃣ <b>Buy/Sell</b> — Direct links to pump.fun\n"
+        "   & Phantom wallet for trading\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📌 <b>Commands</b>\n"
@@ -235,7 +230,7 @@ def build_help_msg() -> tuple[str, InlineKeyboardMarkup]:
 def build_deploying_msg(name: str, ticker: str, step: int) -> str:
     steps = [
         ("🔍", "Finding trending meme...", "⏳"),
-        ("📡", "Deploying token on Solana...", "⏳"),
+        ("📡", "Deploying on pump.fun...", "⏳"),
         ("📝", "Generating profile...", "⏳"),
     ]
     lines = [
@@ -400,11 +395,14 @@ async def _do_launch(message, context, custom_name=None, category=None, edit=Fal
         else:
             message = await message.reply_text(deploying_text, parse_mode=ParseMode.HTML)
 
-        # Step 2: Deploy on-chain
-        coin = create_memecoin(name, ticker, cat)
+        # Step 2: Generate profile first (need description for pump.fun)
+        profile = generate_full_profile(name, ticker, cat, mint_address="TBD")
 
-        # Step 3: Generate profile
+        # Step 3: Deploy on pump.fun
+        coin = await create_memecoin(name, ticker, profile["description"], cat)
+
         await message.edit_text(build_deploying_msg(name, ticker, 2), parse_mode=ParseMode.HTML)
+        # Update profile with actual mint address
         profile = generate_full_profile(name, ticker, cat, coin["mint_address"])
 
         # Done — show full launch card with buttons
@@ -422,7 +420,7 @@ async def _do_launch(message, context, custom_name=None, category=None, edit=Fal
         err = (
             f"❌ <b>Launch failed:</b> {e}\n\n"
             "Make sure you have:\n"
-            "  • SOL in your wallet\n"
+            "  • SOL in your wallet (for pump.fun fees)\n"
             "  • Valid private key in .env"
         )
         keyboard = InlineKeyboardMarkup([

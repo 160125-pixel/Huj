@@ -1,35 +1,26 @@
 """
-Solana memecoin creator with market cap targeting.
+Solana memecoin creator via pump.fun.
 
-Creates SPL tokens on Solana, calculates supply and initial liquidity
-to hit a target market cap of 10-20k USD at launch.
+Launches tokens through pump.fun's API with market cap targeting
+of 10-20k USD at launch.
 """
 
 import random
 import base58
-from solana.rpc.api import Client
+import json
+import logging
+
+import aiohttp
 from solders.keypair import Keypair
-from solders.system_program import CreateAccountParams, create_account
-from solders.transaction import Transaction
-from solders.message import Message
-from spl.token.instructions import (
-    InitializeMintParams,
-    MintToParams,
-    initialize_mint,
-    mint_to,
-    get_associated_token_address,
-    create_associated_token_account,
-)
-from spl.token.constants import TOKEN_PROGRAM_ID
 
 from bot.config import (
     SOLANA_RPC_URL, SOLANA_PRIVATE_KEY,
     TARGET_MCAP_MIN, TARGET_MCAP_MAX, INITIAL_SOL_PRICE_USD,
 )
 
+logger = logging.getLogger(__name__)
 
-def get_client() -> Client:
-    return Client(SOLANA_RPC_URL)
+PUMPFUN_API_URL = "https://pumpportal.fun/api"
 
 
 def get_payer_keypair() -> Keypair:
@@ -40,150 +31,137 @@ def get_payer_keypair() -> Keypair:
 
 def calculate_tokenomics(target_mcap: float, sol_price: float) -> dict:
     """
-    Calculate supply, initial price, and liquidity needed for target market cap.
+    Calculate initial buy amount in SOL to hit target market cap on pump.fun.
 
-    For a memecoin launching at $10-20k market cap:
-    - Pick a large total supply (looks attractive to buyers)
-    - Set initial token price = target_mcap / supply
-    - Calculate SOL needed for initial liquidity pool
-
-    Returns:
-        Dict with supply, price_per_token, liquidity_sol, liquidity_usd, etc.
+    Pump.fun uses a bonding curve — the initial buy sets the starting price.
+    We calculate how much SOL to put in as the initial dev buy to reach
+    the desired market cap range.
     """
-    # Max supply is 1 billion
-    supply = random.choice([
-        1_000_000_000,       # 1B
-        690_000_000,         # 690M (meme number)
-        420_690_000,         # 420.69M
-        999_999_999,         # just under 1B
-        777_000_000,         # 777M (lucky number)
-        500_000_000,         # 500M
-    ])
+    # Max supply is 1 billion (pump.fun default)
+    supply = 1_000_000_000
 
-    # Price per token at target mcap
     price_per_token = target_mcap / supply
 
-    # Initial liquidity: we seed the pool with some tokens + SOL
-    # Typical AMM: liquidity_tokens * liquidity_sol = k (constant product)
-    # We put ~10% of supply into the pool + equivalent SOL value
-    pool_token_pct = 0.10
-    pool_tokens = int(supply * pool_token_pct)
-    pool_value_usd = pool_tokens * price_per_token
-    liquidity_sol = pool_value_usd / sol_price
+    # Initial dev buy in SOL to set the market cap
+    # On pump.fun, the initial buy seeds the bonding curve
+    initial_buy_usd = target_mcap * 0.01  # ~1% of target mcap as initial buy
+    initial_buy_sol = round(initial_buy_usd / sol_price, 4)
+
+    # Ensure minimum buy (pump.fun requires > 0 SOL)
+    initial_buy_sol = max(initial_buy_sol, 0.1)
 
     return {
         "total_supply": supply,
-        "decimals": 9,
+        "decimals": 6,  # pump.fun uses 6 decimals
         "price_per_token_usd": price_per_token,
-        "pool_token_amount": pool_tokens,
-        "pool_token_pct": pool_token_pct,
-        "liquidity_sol": round(liquidity_sol, 4),
-        "liquidity_usd": round(pool_value_usd, 2),
+        "initial_buy_sol": initial_buy_sol,
+        "initial_buy_usd": round(initial_buy_sol * sol_price, 2),
         "target_mcap": target_mcap,
     }
 
 
-def create_memecoin(name: str, ticker: str, category: str = "meme") -> dict:
+async def create_memecoin(name: str, ticker: str, description: str,
+                          category: str = "meme") -> dict:
     """
-    Create and deploy a memecoin on Solana.
+    Create and deploy a memecoin on pump.fun.
 
-    1. Calculate tokenomics for 10-20k market cap
-    2. Create SPL token mint
-    3. Mint supply to creator wallet
-    4. Return full details including liquidity requirements
+    Steps:
+    1. Generate a new mint keypair
+    2. Calculate tokenomics for target market cap
+    3. Call pump.fun API to create the token
+    4. Return full details with pump.fun links
 
     Args:
         name: Token name
-        ticker: Token ticker symbol
-        category: Trend category for description generation
+        ticker: Ticker symbol (without $)
+        description: Token description
+        category: Trend category
 
     Returns:
-        Dict with all token + deployment details
+        Dict with token details, pump.fun links, and tokenomics
     """
-    client = get_client()
     payer = get_payer_keypair()
+    mint_keypair = Keypair()
 
-    # Target a random market cap in the 10-20k range
     target_mcap = random.uniform(TARGET_MCAP_MIN, TARGET_MCAP_MAX)
     tokenomics = calculate_tokenomics(target_mcap, INITIAL_SOL_PRICE_USD)
 
-    supply = tokenomics["total_supply"]
-    decimals = tokenomics["decimals"]
+    # Clean ticker (pump.fun wants it without $)
+    clean_ticker = ticker.replace("$", "").strip()
 
-    # Create new mint
-    mint_keypair = Keypair()
-    mint_pubkey = mint_keypair.pubkey()
+    # Build the pump.fun create request
+    form_data = aiohttp.FormData()
+    form_data.add_field("action", "create")
+    form_data.add_field("tokenMetadata", json.dumps({
+        "name": name,
+        "symbol": clean_ticker,
+        "description": description,
+    }))
+    form_data.add_field("mint", base58.b58encode(bytes(mint_keypair)).decode())
+    form_data.add_field("denominatedInSol", "true")
+    form_data.add_field("amount", str(tokenomics["initial_buy_sol"]))
+    form_data.add_field("slippage", "15")
+    form_data.add_field("priorityFee", "0.005")
+    form_data.add_field("pool", "pump")
 
-    min_balance = client.get_minimum_balance_for_rent_exemption(82).value
+    # Sign with payer private key
+    payer_b58 = base58.b58encode(bytes(payer)).decode()
 
-    # Build transaction with all instructions
-    create_account_ix = create_account(
-        CreateAccountParams(
-            from_pubkey=payer.pubkey(),
-            to_pubkey=mint_pubkey,
-            lamports=min_balance,
-            space=82,
-            owner=TOKEN_PROGRAM_ID,
-        )
-    )
+    async with aiohttp.ClientSession() as session:
+        # Request the transaction from pump.fun portal API
+        trade_payload = {
+            "publicKey": str(payer.pubkey()),
+            "action": "create",
+            "tokenMetadata": {
+                "name": name,
+                "symbol": clean_ticker,
+                "description": description,
+            },
+            "mint": base58.b58encode(bytes(mint_keypair)).decode(),
+            "denominatedInSol": True,
+            "amount": tokenomics["initial_buy_sol"],
+            "slippage": 15,
+            "priorityFee": 0.005,
+            "pool": "pump",
+        }
 
-    init_mint_ix = initialize_mint(
-        InitializeMintParams(
-            program_id=TOKEN_PROGRAM_ID,
-            mint=mint_pubkey,
-            decimals=decimals,
-            mint_authority=payer.pubkey(),
-            freeze_authority=payer.pubkey(),
-        )
-    )
+        async with session.post(
+            f"{PUMPFUN_API_URL}/trade-local",
+            json=trade_payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise Exception(f"Pump.fun API error ({resp.status}): {error_text}")
 
-    ata = get_associated_token_address(payer.pubkey(), mint_pubkey)
-    create_ata_ix = create_associated_token_account(
-        payer=payer.pubkey(),
-        owner=payer.pubkey(),
-        mint=mint_pubkey,
-    )
+            tx_bytes = await resp.read()
 
-    raw_amount = supply * (10 ** decimals)
-    mint_to_ix = mint_to(
-        MintToParams(
-            program_id=TOKEN_PROGRAM_ID,
-            mint=mint_pubkey,
-            dest=ata,
-            mint_authority=payer.pubkey(),
-            amount=raw_amount,
-            signers=[payer.pubkey()],
-        )
-    )
+        # Sign and send the transaction
+        from solders.transaction import VersionedTransaction
+        from solana.rpc.api import Client
 
-    recent_blockhash = client.get_latest_blockhash().value.blockhash
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        # Create a new signed transaction
+        signed_tx = VersionedTransaction(tx.message, [payer, mint_keypair])
 
-    msg = Message.new_with_blockhash(
-        [create_account_ix, init_mint_ix, create_ata_ix, mint_to_ix],
-        payer.pubkey(),
-        recent_blockhash,
-    )
-    tx = Transaction.new_unsigned(msg)
-    tx.sign([payer, mint_keypair], recent_blockhash)
+        client = Client(SOLANA_RPC_URL)
+        tx_resp = client.send_transaction(signed_tx)
+        tx_signature = str(tx_resp.value)
 
-    tx_resp = client.send_transaction(tx)
-    tx_signature = str(tx_resp.value)
-
-    # Build explorer URL
-    cluster_param = "?cluster=devnet" if "devnet" in SOLANA_RPC_URL else ""
-    explorer_base = "https://explorer.solana.com"
+    mint_address = str(mint_keypair.pubkey())
 
     return {
         "name": name,
-        "ticker": ticker,
+        "ticker": f"${clean_ticker}",
         "category": category,
-        "supply": supply,
-        "decimals": decimals,
-        "mint_address": str(mint_pubkey),
-        "token_account": str(ata),
+        "supply": tokenomics["total_supply"],
+        "decimals": tokenomics["decimals"],
+        "mint_address": mint_address,
         "tx_signature": tx_signature,
-        "explorer_url": f"{explorer_base}/address/{str(mint_pubkey)}{cluster_param}",
-        "tx_url": f"{explorer_base}/tx/{tx_signature}{cluster_param}",
+        "pumpfun_url": f"https://pump.fun/coin/{mint_address}",
+        "explorer_url": f"https://solscan.io/token/{mint_address}",
+        "tx_url": f"https://solscan.io/tx/{tx_signature}",
+        "phantom_url": f"https://phantom.app/ul/browse/https://pump.fun/coin/{mint_address}",
         "rpc_url": SOLANA_RPC_URL,
         "tokenomics": tokenomics,
     }
